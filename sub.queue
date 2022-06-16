@@ -1,0 +1,242 @@
+#!/bin/bash
+#
+# This is a top-level handler for sending jobs to SLURM. It uses
+# the names of queues and some features particular to CSIC's
+# Trueno cluster, but it could be easily generalized.
+#
+# It runs under bash because it relies on mathematical operations
+# provided by that shell.
+
+jobbase="$HOME/jobs"  # Directory where jobs & logs are stored
+name='job.'           # Prefix for job names
+timelimit=''          # Wallclock time limit
+nnodes='1'            # Number of independent computers
+ntasks='1'            # Number of MPI tasks or jobs to run over all nodes
+mkl='4'               # Number of MKL / OMP threads per job
+memlimit='2048m'      # Memory limit per cpu
+queue=''              # Queue for jobs
+output=''             # Output file name
+scratch='no'          # 'yes' means work in the scratch directory
+mpi='no'              # Whether to use MPI
+PYTHONENV='base'      # Conda environment to activate
+
+stop=''
+while [ -z "$stop" -a -n "$1" ]; do
+    case $1 in
+	-scratch|--scratch)
+	        scratch='yes';;
+	-cancel|--cancel)
+		rm -rf "$jobbase"/job* "$jobbase/pending/*" "$jobbase/output/"*
+		qstat | grep server | cut -f 1 -d '.'
+	        for i in `qstat | grep server | cut -f 1 -d '.'`; do
+		    echo Cancelling job $i
+		    qdel $i;
+		done
+		exit;;
+	-mpi)
+	        shift; ntasks="$1"; mpi=yes; shift;;
+	-tasks)
+	        shift; ntasks="$1"; mpi=no; shift;;
+ 	-env)
+	        shift; PYTHONENV="$1"; shift;;
+	-clean|--clean)
+	        rm -rf "$jobbase"/job* "$jobbase/pending/*" "$jobbase/output/"*
+		exit;;
+	-N)	shift; name="$1"; shift;;
+	-m)	shift; memlimit="$1"; shift;;
+	-n)	shift; nnodes="$1"; shift;;
+	-ppn|--ppn|-mkl|--mkl)
+	        shift; mkl="$1"; shift;;
+	-q)	shift; queue="$1"; shift;;
+	-o)	shift; output="$1"; shift;;
+	-t)	shift; timelimit="$1"; shift;;
+	-h|--help)
+cat <<EOF
+sub.trueno [-N name] [-m memory] [-n nnodes] [[-mkl | -ppn] ppn]
+           [-q queue] [-o outputfile] [-mpi ntasks]
+           [-t time] [-h|--help] command-to-run
+
+Option    Explanation (default value)
+------    ----------------------------------------------------
+nproc     # of nodes to use ($nnodes)
+ntask     # of MPI tasks to run ($mpi)
+ppn       # of processes per node and MKL threads ($mkl)
+queue     queue name to use ($queue)
+memory    memory limit for each cpu, in megabytes ($memlimit)
+time      wallclock time limit for whole job (2 hours)
+output    output file (defaults to the usual pool at $jobbase)
+
+Examples:
+
+sub.queue --clean
+   Remove all jobs from the queue, including output files.
+   Does not kill the jobs if they are running.
+
+sub.queue -mkl 4 python -u heavy_numpy_process.py
+   Run a Python numerical job with 4 MKL threads, to speed up
+   the Numpy library.
+
+sub.queue -mpi 5 -n 5 -mkl 3 python -u mpijob.py
+   Launch a Python MPI job with 5 tasks, spread over 5 computers
+   using 3 processors per job.
+
+sub.queue -mpi 5 -mkl 3 -mpi python -u mpijob.py
+   Similar as above, but let the system decide the number of nodes.
+EOF
+                exit 0
+                ;;
+        -*)     echo 'Unknown option'$1 ; exit 1;;
+	*)      stop='stop';;
+    esac
+done
+#
+# Checking whether arguments are valid
+if [ -z "$*" ]; then
+  echo Nothing to run
+  exit 0
+fi
+case "$mkl" in
+  *[!0-9]*) echo "-mkl value must be a nonzero integer without sign"; exit 1;;
+  *) ;;
+esac
+case "$nnodes" in
+  *[!0-9]*) echo "-n value must be a nonzero integer without sign";;# exit 1;;
+  *) ;;
+esac
+case "$ntasks" in
+  *[!0-9]*) echo "-mpi value must be a nonzero integer without sign"; exit 1;;
+  *) ;;
+esac
+#
+# Ensure hierarchy of directories for job scripts and logs. Create
+# names for those files.
+#
+if test -d $jobbase; then
+  k=`ls $jobbase 2>/dev/null | grep 'job\.' | tail -1 | sed 's,job\.0*\([^0][0-9]*\),\1,g'`;
+  if [ -z "$k" ]; then
+    k=1;
+  else
+    k=$(($k + 1))
+  fi
+else
+  mkdir $jobbase
+  mkdir $jobbase/output
+  k=1
+fi
+jobid=`printf "%04d" $k`
+jobfile="$jobbase/job.$jobid"
+if [ -z "$output" ]; then
+  output="$jobbase/output/job.${jobid}"
+fi
+joberr="${output}.log"
+jobout="${output}.log"
+joblog="${output}.log"
+#
+# Transform arguments into SLURM parameters for the job script
+if [ -n "$memlimit" ]; then
+  memlimit="SBATCH --mem-per-cpu=$memlimit"
+else
+  memlimit=""
+fi
+if [ -n "$timelimit" ]; then
+  timelimit="SBATCH -t $timelimit"
+else
+  timelimit=" no limit"
+fi
+if [ "x$queue" = "x" ]; then
+  if [ "$nnodes" = 1 ]; then
+     queue="generic"
+  else
+     queue="special"
+  fi
+fi
+if [ -n "$queue" ]; then
+  queuestmt="SBATCH -p $queue"
+else
+  queuestmt=" default queue"
+fi
+if [ "$nnodes" = 1 ] ; then
+  SBATCH_NNODES="SBATCH --nodes $nnodes"
+fi
+#
+# Create the job file and submit it.
+#
+cat > $jobfile <<EOF
+#!/bin/sh
+#
+# file:    pbs.template
+#
+# purpose: template for PBS (Portable Batch System) script
+#
+# remarks: a line beginning with # is a comment;
+#          a line beginning with #PBS is a pbs command;
+#          assume (upper/lower) case to be sensitive;
+#
+# use:     submit job with
+#          sbatch pbs.template
+#
+# job name (default is name of pbs script file)
+#SBATCH -J ${name}${jobid}
+#
+# resource limits: number of CPUs to be used
+#$SBATCH_NNODES
+#SBATCH --ntasks $ntasks
+#SBATCH --cpus-per-task $mkl
+#
+# resource limits: amount of memory to be used
+#$memlimit
+#
+# resource limits: max. wall clock time during which job can be running
+#$timelimit
+#
+# path/filename for standard output
+#SBATCH -o $jobout
+#
+# join streams for standard output and error
+#SBATCH -e $jobout
+#
+# queue name, one of {default, special express}
+# The default queue, "default", need not be specified
+#$queuestmt
+#
+# export all my environment variables to the job
+# ????
+#
+###
+cd \$SLURM_SUBMIT_DIR
+if [ $mkl -gt 1 ]; then
+  export OMP_NUM_THREADS=$mkl
+  export MKL_NUM_THREADS=$mkl
+  export MKL_DYNAMIC=false
+fi
+export PATH="$PATH"
+export LD_LIBRARY_PATH="$LD_LIBRARY_PATH"
+#
+# If we selected scratch space, move data and executable
+# files there. Otherwise, run job from the current directory.
+if test "$scratch" = yes; then
+  SCRATCHDIR=/scratch-global/\$USER/\$SLURM_JOBID
+  rsync \$SLURM_SUBMIT_DIR/{*.exe,*.sh,cache} \$SCRATCHDIR/
+  cd \$SCRATCHDIR/
+else
+  cd `pwd`
+fi
+#
+# Activate Python environment
+if [ -d ~/miniconda3 ]; then
+  . ~/miniconda3/bin/activate $CONDA_DEFAULT_ENV
+fi
+#
+# If the job is MPI, use mpich to run it. Otherwise send it
+# as normal, redirecting error to standard output.
+if [ "x$mpi" = "xno" ]; then
+   ($@) 2>&1
+else
+   (mpiexec -n $ntasks $@) 2>&1
+fi
+if test "$scratch" = yes; then
+  rm \$SCRATCHDIR/*.exe \$SCRATCHDIR/*.sh
+  mv \$SCRATCHDIR/* \$SLURM_SUBMIT_DIR/
+fi
+EOF
+sbatch -p $queue $jobfile
